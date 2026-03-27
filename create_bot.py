@@ -1,9 +1,10 @@
 #!/usr/bin/env python3
 """
-Slack Bot Creator — Programmatic app creation via the Slack App Manifest API.
+Slack Bot Creator — Programmatic app creation & management via the Manifest API.
 
-Creates fully-configured Slack apps without ever touching the Slack admin UI.
-Handles config token rotation, manifest validation, and app creation in one shot.
+Create and update Slack apps without ever touching the Slack admin UI.
+Handles config token rotation, manifest validation, and app creation/updates
+in a single command.
 
 Prerequisites:
   1. Go to https://api.slack.com/apps
@@ -13,25 +14,24 @@ Prerequisites:
   5. Store them as environment variables or in a .env file
 
 Usage:
-  # Via environment variables:
-  export SLACK_CONFIG_TOKEN="xoxe.xoxp-..."
-  export SLACK_CONFIG_REFRESH_TOKEN="xoxe-..."
-  python create_bot.py
+  # Create a new bot:
+  python create_bot.py --name "Deploy Bot"
 
-  # Override bot name and display name:
-  python create_bot.py --name "Deploy Bot" --display-name "deploy-bot"
+  # Update an existing app's name:
+  python create_bot.py --app-id A0123ABCDEF --name "New Name"
 
-  # Set a custom app icon:
+  # Export an existing app's manifest:
+  python create_bot.py --app-id A0123ABCDEF --export
+
+  # Set a custom app icon (works for create or update):
   python create_bot.py --icon bot_avatar.png
 
   # Preview the manifest without creating anything:
   python create_bot.py --dry-run
-
-  # Use a .env file (auto-detected in current directory):
-  python create_bot.py
 """
 
 import argparse
+import copy
 import json
 import mimetypes
 import os
@@ -156,6 +156,38 @@ def build_manifest(config: BotConfig) -> dict:
     return manifest
 
 
+def apply_overrides(manifest: dict, args: argparse.Namespace) -> dict:
+    """Patch only the fields the user explicitly passed via CLI flags."""
+
+    manifest = copy.deepcopy(manifest)
+
+    if args.name is not None:
+        manifest.setdefault("display_information", {})["name"] = args.name
+
+    if args.display_name is not None:
+        manifest.setdefault("features", {}).setdefault("bot_user", {})["display_name"] = args.display_name
+    elif args.name is not None:
+        derived = args.name.lower().replace(" ", "-")
+        manifest.setdefault("features", {}).setdefault("bot_user", {})["display_name"] = derived
+
+    if args.description is not None:
+        manifest.setdefault("display_information", {})["description"] = args.description
+
+    if args.no_socket_mode:
+        manifest.setdefault("settings", {})["socket_mode_enabled"] = False
+        if args.request_url:
+            settings = manifest["settings"]
+            event_subs = settings.get("event_subscriptions", {})
+            event_subs["request_url"] = args.request_url
+            settings["event_subscriptions"] = event_subs
+            settings["interactivity"] = {
+                "is_enabled": True,
+                "request_url": args.request_url,
+            }
+
+    return manifest
+
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Slack API Client
 # ──────────────────────────────────────────────────────────────────────────────
@@ -198,6 +230,18 @@ def rotate_token(refresh_token: str) -> tuple[str, str]:
         sys.exit(1)
 
     return result["token"], result["refresh_token"]
+
+
+def export_manifest(token: str, app_id: str) -> dict:
+    """Fetch the current manifest for an existing app."""
+
+    result = slack_api_call("apps.manifest.export", token, {"app_id": app_id})
+
+    if not result.get("ok"):
+        print(f"  ❌ Export failed: {result.get('error', 'unknown')}")
+        sys.exit(1)
+
+    return result["manifest"]
 
 
 def set_app_icon(token: str, app_id: str, image_path: Path) -> dict:
@@ -258,9 +302,26 @@ def load_dotenv(path: Path = Path(".env")) -> None:
             os.environ.setdefault(key, value)
 
 
+def require_credentials() -> tuple[str, str]:
+    """Load and return (config_token, refresh_token), exiting if missing."""
+
+    config_token = os.environ.get("SLACK_CONFIG_TOKEN", "")
+    refresh_token = os.environ.get("SLACK_CONFIG_REFRESH_TOKEN", "")
+
+    if not config_token or not refresh_token:
+        print("\n❌ Missing credentials.")
+        print("   Set SLACK_CONFIG_TOKEN and SLACK_CONFIG_REFRESH_TOKEN")
+        print("   as environment variables or in a .env file.")
+        print("   Generate them at: https://api.slack.com/apps")
+        print("   (scroll to 'Your App Configuration Tokens')")
+        sys.exit(1)
+
+    return config_token, refresh_token
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Create a Slack bot app programmatically via the Manifest API.",
+        description="Create or update Slack bot apps via the Manifest API.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""\
 examples:
@@ -269,7 +330,24 @@ examples:
   %(prog)s --icon avatar.png                # set a profile picture
   %(prog)s --dry-run                        # preview manifest only
   %(prog)s --no-socket-mode                 # use HTTP request URLs instead
+
+  # update an existing app:
+  %(prog)s --app-id A0123ABC --name "New Name"
+  %(prog)s --app-id A0123ABC --icon avatar.png
+
+  # export an app's current manifest:
+  %(prog)s --app-id A0123ABC --export
 """,
+    )
+
+    parser.add_argument(
+        "--app-id",
+        help="target an existing app to update (instead of creating a new one)",
+    )
+    parser.add_argument(
+        "--export",
+        action="store_true",
+        help="export the current manifest of --app-id and print it (no changes made)",
     )
     parser.add_argument(
         "--name",
@@ -300,22 +378,121 @@ examples:
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="print the manifest JSON and exit without creating the app",
+        help="print the manifest JSON and exit without creating/updating the app",
     )
     return parser.parse_args()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
-# Main
+# Flows
 # ──────────────────────────────────────────────────────────────────────────────
 
-def main():
-    args = parse_args()
-    load_dotenv()
+def flow_export(args: argparse.Namespace) -> None:
+    """Export and print the current manifest for an existing app."""
 
+    config_token, refresh_token = require_credentials()
+
+    print("\n[1/2] Rotating config token...")
+    config_token, refresh_token = rotate_token(refresh_token)
+    print("  ✅ Token rotated.")
+    print(f"  💡 New refresh token: {refresh_token}")
+
+    print(f"\n[2/2] Exporting manifest for {args.app_id}...")
+    manifest = export_manifest(config_token, args.app_id)
+    print("  ✅ Manifest exported.\n")
+    print(json.dumps(manifest, indent=2))
+
+
+def flow_update(args: argparse.Namespace) -> None:
+    """Update an existing app by patching its current manifest."""
+
+    config_token, refresh_token = require_credentials()
+
+    has_icon = args.icon is not None
+    total_steps = 5 + int(has_icon)
+
+    # 1. Rotate token
+    print(f"\n[1/{total_steps}] Rotating config token...")
+    config_token, refresh_token = rotate_token(refresh_token)
+    print("  ✅ Token rotated.")
+    print(f"  💡 New refresh token: {refresh_token}")
+
+    # 2. Export current manifest
+    print(f"\n[2/{total_steps}] Exporting current manifest for {args.app_id}...")
+    current_manifest = export_manifest(config_token, args.app_id)
+    app_name = current_manifest.get("display_information", {}).get("name", args.app_id)
+    print(f"  ✅ Exported manifest for \"{app_name}\".")
+
+    # 3. Apply overrides
+    print(f"\n[3/{total_steps}] Applying changes...")
+    updated_manifest = apply_overrides(current_manifest, args)
+
+    changes = diff_manifests(current_manifest, updated_manifest)
+    if not changes and not has_icon:
+        print("  ⚠️  No changes detected. Pass flags like --name or --description")
+        print("     to modify the app, or --icon to update the profile picture.")
+        return
+
+    for change in changes:
+        print(f"  • {change}")
+    if not changes:
+        print("  (manifest unchanged — icon only)")
+
+    if args.dry_run:
+        print(f"\n[dry-run] Updated manifest:\n")
+        print(json.dumps(updated_manifest, indent=2))
+        return
+
+    # 4. Validate
+    print(f"\n[4/{total_steps}] Validating manifest...")
+    validation = slack_api_call("apps.manifest.validate", config_token, {
+        "manifest": updated_manifest,
+    })
+
+    if not validation.get("ok"):
+        print("  ❌ Manifest validation failed:")
+        for err in validation.get("errors", []):
+            print(f"     • {err.get('message', '')} (at {err.get('pointer', '')})")
+        sys.exit(1)
+    print("  ✅ Manifest is valid.")
+
+    # 5. Update
+    print(f"\n[5/{total_steps}] Updating app {args.app_id}...")
+    result = slack_api_call("apps.manifest.update", config_token, {
+        "app_id": args.app_id,
+        "manifest": updated_manifest,
+    })
+
+    if not result.get("ok"):
+        print(f"  ❌ Update failed: {result.get('error', 'unknown')}")
+        for err in result.get("errors", []):
+            print(f"     • {err.get('message', '')} (at {err.get('pointer', '')})")
+        sys.exit(1)
+    print("  ✅ App updated successfully!")
+
+    if result.get("permissions_updated"):
+        print("  ⚠️  Permissions changed — you may need to reinstall the app.")
+
+    # 6. Icon (optional)
+    if has_icon:
+        step = total_steps
+        print(f"\n[{step}/{total_steps}] Uploading app icon ({args.icon.name})...")
+        icon_result = set_app_icon(config_token, args.app_id, args.icon)
+        if not icon_result.get("ok"):
+            print(f"  ⚠️  Icon upload failed: {icon_result.get('error', 'unknown')}")
+            print("  The app was still updated — you can set the icon manually.")
+        else:
+            print("  ✅ App icon set.")
+
+    print()
     print("=" * 60)
-    print("  Slack Bot Creator — Manifest API")
+    print(f"  ✅ App {args.app_id} updated")
+    print(f"  → https://api.slack.com/apps/{args.app_id}")
     print("=" * 60)
+
+
+def flow_create(args: argparse.Namespace) -> None:
+    """Create a new app from a BotConfig manifest."""
 
     config = BotConfig()
     if args.name:
@@ -334,34 +511,24 @@ def main():
 
     manifest = build_manifest(config)
 
-    # --dry-run: just dump the manifest and exit
     if args.dry_run:
         print("\n[dry-run] Generated manifest:\n")
         print(json.dumps(manifest, indent=2))
         return
 
-    # Load credentials from env
-    config_token = os.environ.get("SLACK_CONFIG_TOKEN", "")
-    refresh_token = os.environ.get("SLACK_CONFIG_REFRESH_TOKEN", "")
+    config_token, refresh_token = require_credentials()
 
-    if not config_token or not refresh_token:
-        print("\n❌ Missing credentials.")
-        print("   Set SLACK_CONFIG_TOKEN and SLACK_CONFIG_REFRESH_TOKEN")
-        print("   as environment variables or in a .env file.")
-        print("   Generate them at: https://api.slack.com/apps")
-        print("   (scroll to 'Your App Configuration Tokens')")
-        sys.exit(1)
+    has_icon = args.icon is not None
+    total_steps = 4 + int(has_icon)
 
-    total_steps = 5 if args.icon else 4
-
-    # Step 1 — Rotate token (config tokens expire every 12 hours)
+    # 1. Rotate token
     print(f"\n[1/{total_steps}] Rotating config token...")
     config_token, refresh_token = rotate_token(refresh_token)
     print("  ✅ Token rotated.")
     print(f"  💡 Save your new refresh token for next time:")
     print(f"     {refresh_token}")
 
-    # Step 2 — Show manifest summary
+    # 2. Show manifest summary
     print(f"\n[2/{total_steps}] Building app manifest...")
     print(f"  App name:    {config.name}")
     print(f"  Bot user:    @{config.display_name}")
@@ -369,7 +536,7 @@ def main():
     print(f"  Events:      {len(config.bot_events)}")
     print(f"  Socket Mode: {config.socket_mode}")
 
-    # Step 3 — Validate
+    # 3. Validate
     print(f"\n[3/{total_steps}] Validating manifest...")
     validation = slack_api_call("apps.manifest.validate", config_token, {
         "manifest": manifest,
@@ -382,7 +549,7 @@ def main():
         sys.exit(1)
     print("  ✅ Manifest is valid.")
 
-    # Step 4 — Create the app
+    # 4. Create the app
     print(f"\n[4/{total_steps}] Creating Slack app...")
     result = slack_api_call("apps.manifest.create", config_token, {
         "manifest": manifest,
@@ -394,10 +561,13 @@ def main():
             print(f"     • {err.get('message', '')} (at {err.get('pointer', '')})")
         sys.exit(1)
 
-    # Step 5 (optional) — Upload app icon
-    if args.icon:
-        print(f"\n[5/{total_steps}] Uploading app icon ({args.icon.name})...")
-        icon_result = set_app_icon(config_token, result["app_id"], args.icon)
+    app_id = result.get("app_id", "???")
+
+    # 5. Icon (optional)
+    if has_icon:
+        step = total_steps
+        print(f"\n[{step}/{total_steps}] Uploading app icon ({args.icon.name})...")
+        icon_result = set_app_icon(config_token, app_id, args.icon)
         if not icon_result.get("ok"):
             print(f"  ⚠️  Icon upload failed: {icon_result.get('error', 'unknown')}")
             print("  The app was still created — you can set the icon manually.")
@@ -406,7 +576,6 @@ def main():
 
     # Done — print credentials
     creds = result.get("credentials", {})
-    app_id = result.get("app_id", "???")
     oauth_url = result.get("oauth_authorize_url", "")
 
     print("  ✅ App created successfully!")
@@ -434,6 +603,56 @@ def main():
     print()
     print("  ⚠️  Store these credentials securely — they won't be shown again!")
     print("=" * 60)
+
+
+def diff_manifests(old: dict, new: dict, path: str = "") -> list[str]:
+    """Return human-readable descriptions of what changed between two manifests."""
+
+    changes = []
+
+    all_keys = set(list(old.keys()) + list(new.keys()))
+    for key in sorted(all_keys):
+        current_path = f"{path}.{key}" if path else key
+        old_val = old.get(key)
+        new_val = new.get(key)
+
+        if old_val == new_val:
+            continue
+
+        if isinstance(old_val, dict) and isinstance(new_val, dict):
+            changes.extend(diff_manifests(old_val, new_val, current_path))
+        elif old_val is None:
+            changes.append(f"{current_path}: (added) → {json.dumps(new_val)}")
+        elif new_val is None:
+            changes.append(f"{current_path}: {json.dumps(old_val)} → (removed)")
+        else:
+            changes.append(f"{current_path}: {json.dumps(old_val)} → {json.dumps(new_val)}")
+
+    return changes
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# Main
+# ──────────────────────────────────────────────────────────────────────────────
+
+def main():
+    args = parse_args()
+    load_dotenv()
+
+    print("=" * 60)
+    print("  Slack Bot Manager — Manifest API")
+    print("=" * 60)
+
+    if args.export and not args.app_id:
+        print("\n❌ --export requires --app-id")
+        sys.exit(1)
+
+    if args.export:
+        flow_export(args)
+    elif args.app_id:
+        flow_update(args)
+    else:
+        flow_create(args)
 
 
 if __name__ == "__main__":

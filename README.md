@@ -1,15 +1,17 @@
 # create-slack-bots
 
-Create Slack bot apps entirely from the command line — no clicking through the Slack admin UI.
+Create, update, and manage Slack bot apps entirely from the command line — no clicking
+through the Slack admin UI.
 
 Uses the [Slack App Manifest API](https://api.slack.com/reference/manifests) to programmatically
-create fully-configured apps with bot users, OAuth scopes, event subscriptions, and Socket Mode
-in a single command.
+create and update fully-configured apps with bot users, OAuth scopes, event subscriptions,
+and Socket Mode in a single command.
 
 ## Why?
 
 Setting up a Slack app through the web UI means clicking through a dozen pages every time.
 This script turns that into one command: define your config, run it, get credentials back.
+Need to change something later? Update it the same way — no UI required.
 
 ## Quick Start
 
@@ -33,7 +35,7 @@ cp .env.example .env
 **3. Create a bot**
 
 ```bash
-python create_bot.py
+python create_bot.py --name "My Bot"
 ```
 
 That's it. The script rotates your config token, validates the manifest, creates the app,
@@ -45,17 +47,19 @@ and prints the credentials you need.
 python create_bot.py [options]
 
 Options:
+  --app-id ID           Target an existing app to update (omit to create new)
+  --export              Export an app's current manifest (use with --app-id)
   --name NAME           App name shown in Slack (default: "My Custom Bot")
   --display-name NAME   Bot @username in conversations
   --description TEXT    Short app description
   --icon PATH           Path to an image file to use as the app icon
   --no-socket-mode      Use HTTP request URLs instead of Socket Mode
   --request-url URL     Events/interactivity URL (with --no-socket-mode)
-  --dry-run             Print the manifest JSON and exit — nothing is created
+  --dry-run             Print the manifest JSON and exit — nothing is created/updated
   -h, --help            Show help
 ```
 
-### Examples
+### Creating Apps
 
 ```bash
 # Create with a custom name
@@ -71,7 +75,34 @@ python create_bot.py --name "Test Bot" --dry-run
 python create_bot.py --name "Webhook Bot" --no-socket-mode --request-url "https://example.com/slack/events"
 ```
 
-## What It Does
+### Updating Existing Apps
+
+Pass `--app-id` to target an existing app. The script exports its current manifest,
+applies only the fields you specify, and pushes the update — so you don't have to
+redefine everything.
+
+```bash
+# Rename an app
+python create_bot.py --app-id A0123ABCDEF --name "New Name"
+
+# Update the description and icon
+python create_bot.py --app-id A0123ABCDEF --description "Does deploys" --icon new_icon.png
+
+# Preview what would change without applying
+python create_bot.py --app-id A0123ABCDEF --name "New Name" --dry-run
+```
+
+### Exporting Manifests
+
+Dump the current manifest of any app you own — useful for inspection or backup.
+
+```bash
+python create_bot.py --app-id A0123ABCDEF --export
+```
+
+## How It Works
+
+### Create Flow
 
 1. **Rotates your config token** — Slack config tokens expire every 12 hours; the script
    handles this automatically and prints the new refresh token.
@@ -81,6 +112,16 @@ python create_bot.py --name "Webhook Bot" --no-socket-mode --request-url "https:
 4. **Creates the app** — Calls `apps.manifest.create` and returns your new app's credentials
    (Client ID, Client Secret, Signing Secret).
 5. **Sets the app icon** (optional) — Uploads a profile picture via `apps.icon.set`.
+
+### Update Flow
+
+1. **Rotates your config token**
+2. **Exports the current manifest** — Fetches the app's live config via `apps.manifest.export`.
+3. **Applies your changes** — Only the fields you specified via CLI flags are patched in;
+   everything else stays untouched.
+4. **Shows a diff** — Prints exactly what changed before proceeding.
+5. **Validates and updates** — Pushes the merged manifest via `apps.manifest.update`.
+6. **Sets the app icon** (optional)
 
 ## After Creation
 
@@ -93,7 +134,7 @@ The script prints next steps, but in short:
 
 ## Customization
 
-Edit the `BotConfig` dataclass in `create_bot.py` to change defaults:
+Edit the `BotConfig` dataclass in `create_bot.py` to change defaults for new apps:
 
 - **`bot_scopes`** — OAuth permission scopes ([full list](https://api.slack.com/scopes))
 - **`bot_events`** — Event subscriptions ([full list](https://api.slack.com/events))
