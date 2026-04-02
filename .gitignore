@@ -197,6 +197,19 @@ cython_debug/
 .cursorignore
 .cursorindexingignore
 
+# Images / profile pics
+*.jpg
+*.jpeg
+*.png
+*.gif
+*.webp
+*.ico
+*.svg
+
+# Local state / secrets
+.last_*.json
+*-export.json
+
 # Marimo
 marimo/_static/
 marimo/_lsp/
